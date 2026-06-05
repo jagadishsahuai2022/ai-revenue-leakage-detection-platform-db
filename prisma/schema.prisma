@@ -1,0 +1,328 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// RevenueGuard – Prisma Schema
+// Multi-tenant SaaS with company_id isolation, RBAC, Stripe billing
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SUPER_ADMIN
+  COMPANY_ADMIN
+  ANALYST
+  VIEWER
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+}
+
+enum SubscriptionPlan {
+  STARTER
+  GROWTH
+  ENTERPRISE
+}
+
+enum LeakageCategory {
+  CHURN
+  DUNNING_FAILURE
+  PRICING_GAP
+  FAILED_UPSELL
+  REFUND
+  DISCOUNT_ABUSE
+  INVOICE_ERROR
+}
+
+enum IntegrationProvider {
+  GITHUB
+  STRIPE
+  SLACK
+  CUSTOM
+}
+
+enum IntegrationStatus {
+  ACTIVE
+  INACTIVE
+  ERROR
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ── Company (Tenant) ─────────────────────────────────────────────────────────
+
+model Company {
+  id              String             @id @default(cuid())
+  name            String
+  slug            String             @unique
+  domain          String?            @unique
+  logoUrl         String?
+  subscriptionId  String?            @unique
+  stripeCustomerId String?           @unique
+  plan            SubscriptionPlan   @default(STARTER)
+  subscriptionStatus SubscriptionStatus @default(TRIALING)
+  trialEndsAt     DateTime?
+  billingEmail    String?
+  settings        Json               @default("{}")
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  users           User[]
+  revenues        Revenue[]
+  leakages        RevenueLeakage[]
+  integrations    Integration[]
+  apiKeys         ApiKey[]
+  auditLogs       AuditLog[]
+  invoices        Invoice[]
+  subscriptionItems SubscriptionItem[]
+
+  @@index([slug])
+  @@index([stripeCustomerId])
+}
+
+// ── User ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(cuid())
+  companyId       String
+  email           String
+  passwordHash    String?
+  name            String
+  avatarUrl       String?
+  role            UserRole  @default(VIEWER)
+  githubId        String?   @unique
+  githubUsername  String?
+  emailVerified   Boolean   @default(false)
+  lastLoginAt     DateTime?
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+
+  @@unique([companyId, email])
+  @@index([companyId])
+  @@index([email])
+  @@index([githubId])
+}
+
+// ── Refresh Tokens ────────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id          String    @id @default(cuid())
+  userId      String
+  token       String    @unique
+  expiresAt   DateTime
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+}
+
+// ── Revenue Record ────────────────────────────────────────────────────────────
+
+model Revenue {
+  id              String    @id @default(cuid())
+  companyId       String
+  externalId      String?
+  customerId      String?
+  customerEmail   String?
+  amount          Decimal   @db.Decimal(14, 2)
+  currency        String    @default("USD") @db.VarChar(3)
+  mrr             Decimal?  @db.Decimal(14, 2)
+  arr             Decimal?  @db.Decimal(14, 2)
+  product         String?
+  plan            String?
+  period          DateTime
+  source          String    @default("manual")
+  metadata        Json      @default("{}")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  leakages        RevenueLeakage[]
+
+  @@unique([companyId, externalId])
+  @@index([companyId])
+  @@index([companyId, period])
+  @@index([companyId, customerId])
+  @@index([period])
+}
+
+// ── Revenue Leakage ───────────────────────────────────────────────────────────
+
+model RevenueLeakage {
+  id              String          @id @default(cuid())
+  companyId       String
+  revenueId       String?
+  category        LeakageCategory
+  title           String
+  description     String?
+  amount          Decimal         @db.Decimal(14, 2)
+  currency        String          @default("USD") @db.VarChar(3)
+  riskScore       Int             @default(0)   // 0-100
+  isResolved      Boolean         @default(false)
+  resolvedAt      DateTime?
+  metadata        Json            @default("{}")
+  detectedAt      DateTime        @default(now())
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  company         Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  revenue         Revenue?        @relation(fields: [revenueId], references: [id])
+
+  @@index([companyId])
+  @@index([companyId, category])
+  @@index([companyId, isResolved])
+  @@index([companyId, detectedAt])
+  @@index([riskScore])
+}
+
+// ── Invoice ───────────────────────────────────────────────────────────────────
+
+model Invoice {
+  id                String    @id @default(cuid())
+  companyId         String
+  stripeInvoiceId   String?   @unique
+  stripeCustomerId  String?
+  amount            Decimal   @db.Decimal(14, 2)
+  currency          String    @default("USD") @db.VarChar(3)
+  status            String
+  invoiceUrl        String?
+  periodStart       DateTime?
+  periodEnd         DateTime?
+  paidAt            DateTime?
+  createdAt         DateTime  @default(now())
+
+  company           Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([stripeInvoiceId])
+}
+
+// ── Subscription Item ─────────────────────────────────────────────────────────
+
+model SubscriptionItem {
+  id                    String    @id @default(cuid())
+  companyId             String
+  stripeSubscriptionId  String    @unique
+  stripePriceId         String
+  plan                  SubscriptionPlan
+  status                SubscriptionStatus
+  currentPeriodStart    DateTime
+  currentPeriodEnd      DateTime
+  cancelAtPeriodEnd     Boolean   @default(false)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  company               Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+// ── Integration ───────────────────────────────────────────────────────────────
+
+model Integration {
+  id              String              @id @default(cuid())
+  companyId       String
+  provider        IntegrationProvider
+  status          IntegrationStatus   @default(INACTIVE)
+  accessToken     String?
+  refreshToken    String?
+  tokenExpiresAt  DateTime?
+  externalId      String?
+  config          Json                @default("{}")
+  lastSyncAt      DateTime?
+  errorMessage    String?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  company         Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, provider])
+  @@index([companyId])
+  @@index([provider])
+}
+
+// ── API Key ───────────────────────────────────────────────────────────────────
+
+model ApiKey {
+  id          String    @id @default(cuid())
+  companyId   String
+  name        String
+  keyHash     String    @unique
+  keyPrefix   String
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([keyHash])
+}
+
+// ── Audit Log ─────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String    @id @default(cuid())
+  companyId   String
+  userId      String?
+  action      String
+  resource    String
+  resourceId  String?
+  ipAddress   String?
+  userAgent   String?
+  metadata    Json      @default("{}")
+  createdAt   DateTime  @default(now())
+
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user        User?     @relation(fields: [userId], references: [id])
+
+  @@index([companyId])
+  @@index([companyId, action])
+  @@index([companyId, createdAt])
+  @@index([userId])
+}
+
+// ── Background Job Log ────────────────────────────────────────────────────────
+
+model JobLog {
+  id          String    @id @default(cuid())
+  companyId   String?
+  jobName     String
+  jobId       String?
+  status      JobStatus @default(PENDING)
+  payload     Json      @default("{}")
+  result      Json?
+  error       String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([companyId])
+  @@index([jobName, status])
+  @@index([createdAt])
+}
